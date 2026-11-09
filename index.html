@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Control de Invernadero</title>
+<style>
+body{font-family:Arial,sans-serif;text-align:center;background:#121212;color:#fff;margin:0;padding:15px}
+.card{background:#1e1e1e;padding:15px;margin:12px auto;max-width:450px;border-radius:10px;border:1px solid #333}
+.monitor{display:flex;flex-direction:column;gap:10px}
+.p1{background:#182533;border:1px solid #007bff;padding:10px;border-radius:8px;text-align:left}
+.p2{background:#252218;border:1px solid #ffc107;padding:10px;border-radius:8px;text-align:left}
+.p3{background:#183322;border:1px solid #28a745;padding:10px;border-radius:8px;text-align:left}
+.lbl{color:#888;font-size:.75em;display:block;margin-top:5px}
+.val{font-weight:bold;font-size:1em;color:#00d2ff}
+h3{margin-top:5px;font-size:1.1em}
+.status{font-size:.85em;color:#888;margin-bottom:6px}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#dc3545;margin-right:6px}
+.dot.ok{background:#28a745}
+.btn-group{display:flex;justify-content:center;gap:8px;margin-top:8px}
+.btn{padding:10px 16px;border:2px solid transparent;border-radius:5px;color:#fff;font-weight:bold;font-size:.85em;cursor:pointer;opacity:.55}
+.btn.sel{opacity:1;border-color:#fff}
+.b-auto{background:#007bff}.b-on{background:#28a745}.b-off{background:#dc3545}
+input{width:100%;padding:11px;margin:4px 0 12px;border-radius:6px;border:1px solid #333;background:#121212;color:#fff;font-size:1rem;box-sizing:border-box}
+label{display:block;text-align:left;color:#888;font-size:.85em}
+.go{width:100%;background:#007bff;opacity:1}
+.err{color:#ff4444;font-size:.85em;min-height:1.2em}
+.link{background:none;border:none;color:#888;text-decoration:underline;cursor:pointer;margin-top:10px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+
+<div id="login" class="card" hidden>
+  <h3>Conectar al invernadero</h3>
+  <form id="form">
+    <label>Servidor MQTT (EMQX)<input id="host" value="f91d6661.ala.us-east-1.emqxsl.com" required></label>
+    <label>Usuario<input id="user" autocomplete="username" required></label>
+    <label>Contraseña<input id="pass" type="password" autocomplete="current-password" required></label>
+    <button class="btn go" type="submit">Conectar</button>
+    <p class="err" id="err"></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <h2>Panel de Control Invernadero</h2>
+  <div class="status"><span class="dot" id="dot"></span><span id="estado">Conectando…</span></div>
+
+  <div class="card">
+    <h3>Monitoreo en Vivo</h3>
+    <div class="monitor">
+      <div class="p1">
+        <strong style="color:#007bff">Parte 1: Agua y Tanques</strong>
+        <span class="lbl">TANQUE PRINCIPAL (Ultrasónico)</span><span id="dist" class="val">-- cm</span>
+        <span class="lbl">TANQUE DE RESERVA (Flotador)</span><span id="reserva" class="val">--</span>
+        <span class="lbl">ESTADO BOMBA (Relé 1)</span><span id="r1" class="val">--</span>
+      </div>
+      <div class="p2">
+        <strong style="color:#ffc107">Parte 2: Tiempo e Iluminación</strong>
+        <span class="lbl">HORA (Timer RTC)</span><span id="hora" class="val">--:--:--</span>
+        <span class="lbl">ESTADO ILUMINACIÓN (Relé 2)</span><span id="r2" class="val">--</span>
+      </div>
+      <div class="p3">
+        <strong style="color:#28a745">Parte 3: Ambiente y Ventilación</strong>
+        <span class="lbl">TEMPERATURA Y HUMEDAD (DHT)</span><span id="th" class="val">-- °C | -- %</span>
+        <span class="lbl">ESTADO VENTILADOR (Relé 3)</span><span id="r3" class="val">--</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card"><h3>Relé 1 - Llenado de agua</h3><div class="btn-group" data-r="1"></div></div>
+  <div class="card"><h3>Relé 2 - Iluminación</h3><div class="btn-group" data-r="2"></div></div>
+  <div class="card"><h3>Relé 3 - Ventilación</h3><div class="btn-group" data-r="3"></div></div>
+
+  <button class="link" id="salir">Cambiar conexión</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const KEY = "invernadero_conexion";
+let client = null, espOnline = false, ultimoDato = 0;
+
+// Botones AUTO / ON / OFF de cada relé
+document.querySelectorAll(".btn-group").forEach(g => {
+  [["auto","AUTO"],["on","ON"],["off","OFF"]].forEach(([c, t]) => {
+    const b = document.createElement("button");
+    b.className = "btn b-" + c; b.textContent = t; b.dataset.c = c;
+    b.onclick = () => { if (client && client.connected) client.publish("invernadero/cmd/r" + g.dataset.r, c); };
+    g.appendChild(b);
+  });
+});
+
+const txt = (on, modo) => (on ? "ENCENDIDO (ON)" : "APAGADO (OFF)") + " · " + (modo === "auto" ? "AUTO" : "MANUAL");
+
+function pintarEstado() {
+  const ok = client && client.connected, vivo = Date.now() - ultimoDato < 8000;
+  $("dot").className = "dot" + (ok && espOnline && vivo ? " ok" : "");
+  $("estado").textContent = !ok ? "Sin conexión al servidor" : (!espOnline || !vivo) ? "El invernadero no responde" : "En línea";
+}
+
+function mostrar(d) {
+  $("dist").textContent = d.dist + " cm";
+  $("hora").textContent = d.hora;
+  $("th").textContent = (d.temp ?? "--") + " °C  |  " + (d.hum ?? "--") + " %";
+  $("reserva").textContent = d.reserva ? "OK (Llenado habilitado)" : "VACÍA (Bloqueado)";
+  $("reserva").style.color = d.reserva ? "#28a745" : "#ff4444";
+  [1, 2, 3].forEach(n => {
+    $("r" + n).textContent = txt(d["r" + n], d["m" + n]);
+    document.querySelectorAll(`.btn-group[data-r="${n}"] .btn`).forEach(b => {
+      b.classList.toggle("sel", b.dataset.c === d["m" + n]);
+    });
+  });
+}
+
+function conectar(c) {
+  if (client) client.end(true);
+  client = mqtt.connect("wss://" + c.host + ":8084/mqtt", {
+    username: c.user, password: c.pass,
+    clientId: "web_" + Math.random().toString(16).slice(2, 10),
+    reconnectPeriod: 3000
+  });
+  client.on("connect", () => {
+    $("login").hidden = true; $("app").hidden = false;
+    localStorage.setItem("invernadero_conexion", JSON.stringify(c));
+    client.subscribe(["invernadero/status", "invernadero/online"]);
+    pintarEstado();
+  });
+  client.on("message", (t, m) => {
+    if (t === "invernadero/online") espOnline = m.toString() === "online";
+    if (t === "invernadero/status") { try { mostrar(JSON.parse(m.toString())); ultimoDato = Date.now(); } catch (e) {} }
+    pintarEstado();
+  });
+  client.on("close", pintarEstado);
+  client.on("error", () => { if ($("app").hidden) $("err").textContent = "No se pudo conectar. Revisá servidor, usuario y contraseña."; });
+}
+
+$("form").onsubmit = e => {
+  e.preventDefault(); $("err").textContent = "";
+  conectar({host: $("host").value.trim(), user: $("user").value.trim(), pass: $("pass").value});
+};
+$("salir").onclick = () => {
+  if (client) client.end(true);
+  localStorage.removeItem(KEY);
+  $("app").hidden = true; $("login").hidden = false;
+};
+
+setInterval(pintarEstado, 2000);
+let g = null;
+try { g = JSON.parse(localStorage.getItem(KEY)); } catch (e) {}
+if (g) { $("host").value = g.host; $("user").value = g.user; conectar(g); }
+else $("login").hidden = false;
+</script>
+</body>
+</html>
